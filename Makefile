@@ -4,27 +4,38 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -pedantic -g
+
 TARGET = myshell
+SERVER = myshell_server
+CLIENT = myshell_client
 
-# Source files
-SOURCES = myshell.c parser.c executor.c error_handler.c
-HEADERS = myshell.h parser.h executor.h error_handler.h
-OBJECTS = $(SOURCES:.c=.o)
+CORE_SOURCES = parser.c executor.c error_handler.c
+CORE_OBJECTS = $(CORE_SOURCES:.c=.o)
 
-# Default target
-all: $(TARGET)
+CLIENT_SOURCES = myshell_client.c network_utils.c
+CLIENT_OBJECTS = $(CLIENT_SOURCES:.c=.o)
 
-# Build the main executable
-$(TARGET): $(OBJECTS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJECTS)
+SERVER_SOURCES = myshell_server.c network_utils.c
+SERVER_OBJECTS = $(SERVER_SOURCES:.c=.o)
 
-# Compile individual object files
+HEADERS = myshell.h parser.h executor.h error_handler.h network_utils.h
+
+all: $(TARGET) $(SERVER) $(CLIENT)
+
+$(TARGET): myshell.o $(CORE_OBJECTS)
+	$(CC) $(CFLAGS) -o $(TARGET) $^
+
+$(SERVER): $(SERVER_OBJECTS) $(CORE_OBJECTS)
+	$(CC) $(CFLAGS) -o $(SERVER) $(filter %.o,$^)
+
+$(CLIENT): $(CLIENT_OBJECTS)
+	$(CC) $(CFLAGS) -o $(CLIENT) $(CLIENT_OBJECTS)
+
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Clean build artifacts
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f *.o $(TARGET) $(SERVER) $(CLIENT)
 
 # Force rebuild
 rebuild: clean all
@@ -35,11 +46,11 @@ install: $(TARGET)
 
 # Create a debug version with additional debug symbols
 debug: CFLAGS += -DDEBUG -O0
-debug: $(TARGET)
+debug: $(TARGET) $(SERVER) $(CLIENT)
 
 # Create an optimized release version
 release: CFLAGS += -O2 -DNDEBUG
-release: $(TARGET)
+release: $(TARGET) $(SERVER) $(CLIENT)
 
 # Check for memory leaks (requires valgrind)
 memcheck: $(TARGET)

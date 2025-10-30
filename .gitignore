@@ -3,6 +3,8 @@
 
 # Executables
 myshell
+myshell_client
+myshell_server
 hello
 
 # Build/output artifacts
@@ -11,13 +13,13 @@ hello
 *.exe
 *.bin
 *.txt 
+err
+errfile
 
 # Editor/OS/trash files
 *~
 .DS_Store
 __pycache__/
 
-
 # Core dumps
 core
-
