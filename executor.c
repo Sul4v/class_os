@@ -191,6 +191,9 @@ int execute_single_command(command_t *cmd, int input_fd, int output_fd) {
         return -1;
     } else if (pid == 0) {
         /* Child process */
+        /* Ensure SIGPIPE has default behavior in children so writers in
+           broken pipelines terminate silently instead of printing errors. */
+        signal(SIGPIPE, SIG_DFL);
         
         /* Redirect input if needed */
         if (local_input_fd != -1 && local_input_fd != STDIN_FILENO) {
@@ -222,8 +225,13 @@ int execute_single_command(command_t *cmd, int input_fd, int output_fd) {
         /* Execute the command */
         execvp(cmd->args[0], cmd->args);
         
-        /* If we reach here, execvp failed */
-        fprintf(stderr, "myshell: %s: %s\n", cmd->args[0], strerror(errno));
+        /* If we reach here, execvp failed. For ENOENT on bare commands (no '/'),
+           print Bash-like 'command not found'; otherwise show strerror. */
+        if (errno == ENOENT && strchr(cmd->args[0], '/') == NULL) {
+            fprintf(stderr, "myshell: %s: command not found\n", cmd->args[0]);
+        } else {
+            fprintf(stderr, "myshell: %s: %s\n", cmd->args[0], strerror(errno));
+        }
         exit(1);
     } else {
         /* Parent process */
@@ -291,6 +299,8 @@ int execute_pipeline(pipeline_t *pipeline) {
             return -1;
         } else if (pids[i] == 0) {
             /* Child process */
+            /* Restore default SIGPIPE disposition for pipeline children */
+            signal(SIGPIPE, SIG_DFL);
             
             /* Setup input redirection */
             if (i == 0) {
@@ -344,7 +354,11 @@ int execute_pipeline(pipeline_t *pipeline) {
             execvp(cmd->args[0], cmd->args);
             
             /* If we reach here, execvp failed */
-            fprintf(stderr, "myshell: %s: %s\n", cmd->args[0], strerror(errno));
+            if (errno == ENOENT && strchr(cmd->args[0], '/') == NULL) {
+                fprintf(stderr, "myshell: %s: command not found\n", cmd->args[0]);
+            } else {
+                fprintf(stderr, "myshell: %s: %s\n", cmd->args[0], strerror(errno));
+            }
             exit(1);
         }
     }

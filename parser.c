@@ -190,7 +190,16 @@ token_t *tokenize(char *line, int *num_tokens) {
         if (!in_single_quote && c == '\\') {
             char next = line[i + 1];
             if (next != '\0') {
-                current_token[current_len++] = next;
+                /* Preserve backslash for common escape sequences so
+                   utilities like `echo -e` receive "\\n", "\\t", etc. */
+                if (next == 'n' || next == 't' || next == 'r' || next == '\\') {
+                    if (current_len < MAX_LINE - 2) {
+                        current_token[current_len++] = '\\';
+                        current_token[current_len++] = next;
+                    }
+                } else {
+                    current_token[current_len++] = next;
+                }
                 token_was_quoted = 1;
                 i++;
             }

@@ -133,37 +133,79 @@ static void log_multiline_output(const char *prefix, const char *output) {
 }
 
 static int extract_missing_command(const char *output, char **missing) {
+    /* Be robust to both messages:
+       - "myshell: <cmd>: command not found"
+       - "myshell: <cmd>: No such file or directory"
+       Scan line-by-line for a prefix and accepted suffixes. */
     const char *prefix = "myshell: ";
-    const char *suffix = ": command not found";
+    const char *suffix1 = "command not found";
+    const char *suffix2 = "No such file or directory";
     size_t prefix_len = strlen(prefix);
-    
+
     if (!output) {
         return 0;
     }
-    
-    while (*output == '\n') {
-        output++;
+
+    const char *p = output;
+    while (*p != '\0') {
+        /* Move to start of next non-empty line */
+        while (*p == '\n') p++;
+        if (*p == '\0') break;
+
+        if (strncmp(p, prefix, prefix_len) == 0) {
+            const char *cmd_start = p + prefix_len;
+            const char *colon = strchr(cmd_start, ':');
+            if (colon) {
+                const char *msg = colon + 1;
+                while (*msg == ' ') msg++;
+                if ((strstr(msg, suffix1) != NULL) || (strstr(msg, suffix2) != NULL)) {
+                    size_t cmd_len = (size_t)(colon - cmd_start);
+                    char *command = malloc(cmd_len + 1);
+                    if (!command) {
+                        return 0;
+                    }
+                    memcpy(command, cmd_start, cmd_len);
+                    command[cmd_len] = '\0';
+                    *missing = command;
+                    return 1;
+                }
+            }
+        }
+
+        /* Advance to next line */
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
     }
-    
-    if (strncmp(output, prefix, prefix_len) != 0) {
+
+    return 0;
+}
+
+/* Verify that a candidate token is actually one of the command names
+   (argv[0]) present in the parsed pipeline of the provided command line. */
+static int is_actual_command_name(const char *command_line, const char *candidate) {
+    if (!command_line || !candidate || *candidate == '\0') {
         return 0;
     }
-    
-    output += prefix_len;
-    const char *end = strstr(output, suffix);
-    if (!end) {
+    pipeline_t pipeline;
+    memset(&pipeline, 0, sizeof(pipeline));
+    char *copy = strdup(command_line);
+    if (!copy) {
         return 0;
     }
-    
-    size_t length = (size_t)(end - output);
-    char *command = malloc(length + 1);
-    if (!command) {
-        return 0;
+    int result = 0;
+    if (parse_command_line(copy, &pipeline) == 0 && pipeline.num_commands > 0) {
+        for (int i = 0; i < pipeline.num_commands; i++) {
+            command_t *cmd = &pipeline.commands[i];
+            if (cmd->argc > 0 && cmd->args[0] && strcmp(cmd->args[0], candidate) == 0) {
+                result = 1;
+                break;
+            }
+        }
     }
-    memcpy(command, output, length);
-    command[length] = '\0';
-    *missing = command;
-    return 1;
+    free(copy);
+    free_pipeline(&pipeline);
+    return result;
 }
 
 static void handle_client(int client_fd) {
@@ -215,21 +257,13 @@ static void handle_client(int client_fd) {
             log_multiline_output("[OUTPUT] Sending output to client:", output);
         } else {
             char *missing_cmd = NULL;
-            if (extract_missing_command(output, &missing_cmd)) {
+            if (extract_missing_command(output, &missing_cmd) &&
+                is_actual_command_name(trimmed, missing_cmd)) {
+                /* Log rubric-formatted line, but send the actual captured output
+                   so client sees both the error and any pipeline output (e.g., '0'). */
                 printf("[ERROR] Command not found: \"%s\"\n", missing_cmd);
-                
-                size_t msg_len = strlen("Command not found: ") + strlen(missing_cmd) + 2;
-                char *custom = malloc(msg_len);
-                if (custom) {
-                    snprintf(custom, msg_len, "Command not found: %s\n", missing_cmd);
-                    log_multiline_output("[OUTPUT] Sending error message to client:", custom);
-                    send_buffer = custom;
-                    send_buffer_allocated = 1;
-                } else {
-                    printf("[ERROR] Failed to allocate error response buffer.\n");
-                    log_multiline_output("[OUTPUT] Sending error message to client:", output);
-                }
-                
+                log_multiline_output("[OUTPUT] Sending error message to client:", output);
+                /* send_buffer remains 'output' */
                 free(missing_cmd);
             } else {
                 printf("[ERROR] Command completed with errors.\n");
