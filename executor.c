@@ -175,11 +175,8 @@ int execute_single_command(command_t *cmd, int input_fd, int output_fd) {
     int local_output_fd = output_fd;
     int local_error_fd = -1;
     
-    /* Check if command exists */
-    if (!check_command_exists(cmd->args[0])) {
-        fprintf(stderr, "myshell: %s: command not found\n", cmd->args[0]);
-        return -1;
-    }
+    /* Do not pre-check command existence here; let execvp fail in the child.
+       This ensures any error message follows the command's redirections. */
     
     /* Setup file redirections */
     if (setup_redirections(cmd, &local_input_fd, &local_output_fd, &local_error_fd) == -1) {
@@ -282,12 +279,8 @@ int execute_pipeline(pipeline_t *pipeline) {
     for (int i = 0; i < pipeline->num_commands; i++) {
         command_t *cmd = &pipeline->commands[i];
         
-        /* Check if command exists */
-        if (!check_command_exists(cmd->args[0])) {
-            fprintf(stderr, "myshell: %s: command not found\n", cmd->args[0]);
-            close_pipes(pipes, num_pipes);
-            return -1;
-        }
+        /* Do not pre-check command existence in the parent; allow the child
+           to exec and emit errors under the proper redirections. */
         
         /* Fork process for this command */
         pids[i] = fork();
