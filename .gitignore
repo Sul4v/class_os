@@ -1,0 +1,23 @@
+# Object files
+*.o
+
+# Executables
+myshell
+hello
+
+# Build/output artifacts
+*.out
+*.log
+*.exe
+*.bin
+*.txt 
+
+# Editor/OS/trash files
+*~
+.DS_Store
+__pycache__/
+
+
+# Core dumps
+core
+
