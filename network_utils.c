@@ -1,3 +1,4 @@
+/* Tiny framing helpers shared by the client and server. */
 #include "network_utils.h"
 
 #include <arpa/inet.h>
@@ -7,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Write exactly 'length' bytes unless the socket errors out. */
 int send_all(int sockfd, const void *buffer, size_t length) {
     const char *ptr = (const char *)buffer;
     size_t sent = 0;
@@ -25,6 +27,7 @@ int send_all(int sockfd, const void *buffer, size_t length) {
     return 0;
 }
 
+/* Read exactly 'length' bytes, looping on EINTR like send_all. */
 int recv_all(int sockfd, void *buffer, size_t length) {
     char *ptr = (char *)buffer;
     size_t received = 0;
@@ -43,6 +46,7 @@ int recv_all(int sockfd, void *buffer, size_t length) {
     return 0;
 }
 
+/* Prepend a 32-bit length prefix before sending the payload. */
 int send_message(int sockfd, const char *data, size_t length) {
     uint32_t net_length = htonl((uint32_t)length);
     
@@ -57,6 +61,7 @@ int send_message(int sockfd, const char *data, size_t length) {
     return send_all(sockfd, data, length);
 }
 
+/* Read a framed message, allocate a NUL-terminated buffer, and report its size. */
 int recv_message(int sockfd, char **data, size_t *length) {
     uint32_t net_length;
     

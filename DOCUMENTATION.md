@@ -146,6 +146,19 @@ make clean && make
 ./myshell
 ```
 
+### Remote Mode (optional Phase 2 feature)
+```bash
+make
+# Terminal A
+./server        # listens on $MYSHELL_PORT or 5050
+# Terminal B
+./client        # connects to $MYSHELL_HOST:$MYSHELL_PORT (defaults to 127.0.0.1:5050)
+```
+
+You can override the defaults without extra arguments by exporting `MYSHELL_HOST` and/or `MYSHELL_PORT`.  
+The server spins up one thread per client so multiple remote shells can run concurrently; every inbound
+and outbound message is logged in the format `[TAG] [Client #n - ip:port] ...` for grading compliance.
+
 ### Example Session
 ```bash
 $ ls -la

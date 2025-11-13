@@ -30,23 +30,30 @@
   - Pipes and redirections are set up with `pipe`/`dup2`
 - Networking pieces
   - `network_utils.c/.h`: small helpers for sending/receiving framed messages
-  - `myshell_server.c`: accepts one client at a time, logs steps, runs commands, sends results
+  - `myshell_server.c`: accepts multiple clients concurrently using a thread-per-connection model, logs every request/response with `[Client #n - ip:port]` context, runs commands, sends results
   - `myshell_client.c`: connects, shows prompt, sends lines, prints server replies
 - Server log format (examples)
-  - `[INFO] Server started, waiting for client connections...`
-  - `[RECEIVED] Received command: "ls -l" from client.`
-  - `[EXECUTING] Executing command: "ls -l"`
-  - `[OUTPUT] Sending output to client:`
-  - On unknown commands: `[ERROR] Command not found: "unknowncmd"`
+  - `[INFO] Client #1 connected from 192.168.1.100:56789. Assigned to Thread-1.`
+  - `[RECEIVED] [Client #2 - 192.168.1.101:56790] Received command: "ls -l"`
+  - `[EXECUTING] [Client #2 - 192.168.1.101:56790] Executing command: "ls -l"`
+  - `[OUTPUT] [Client #2 - 192.168.1.101:56790] Sending output to client:`
+  - On unknown commands: `[ERROR] [Client #2 - 192.168.1.101:56790] Command not found: "unknowncmd"`
 
 ## Execution Instructions
 ```bash
 make clean && make
 # Terminal A (server)
-./myshell_server 5050
+./server        # uses $MYSHELL_PORT or 5050
 # Terminal B (client)
-./myshell_client 127.0.0.1 5050
+./client        # uses $MYSHELL_HOST/$MYSHELL_PORT or 127.0.0.1:5050
 ```
+
+Set `MYSHELL_PORT` (and optionally `MYSHELL_HOST` for the client) to override the defaults without passing command-line arguments.
+
+## Phase 3 Enhancements
+- Thread-per-client server so multiple users can issue commands simultaneously
+- Mandatory, contextual logging for every inbound/outbound message, matching the rubric format
+- Robust error reporting per client (internal errors, command-not-found, disconnects)
 
 ## Testing
 - Basic

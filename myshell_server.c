@@ -1,9 +1,12 @@
+/* Remote myshell server: accepts TCP clients and runs their commands concurrently. */
 #include "myshell.h"
 #include "network_utils.h"
 #include "parser.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +16,44 @@
 #include <unistd.h>
 
 #define DEFAULT_PORT 5050
-#define BACKLOG 5
+#define BACKLOG 10           /* Pending connection queue depth */
+#define SERVER_PORT_ENV "MYSHELL_PORT"
+
+/* All metadata the worker thread needs for logging and cleanup. */
+typedef struct {
+    int client_fd;
+    int client_id;
+    int thread_label;
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port;
+} client_context_t;
+
+/* Global counters guarded by mutexes so log labels never clash. */
+static pthread_mutex_t client_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t thread_label_lock = PTHREAD_MUTEX_INITIALIZER;
+static int next_client_id = 1;
+static int next_thread_label = 1;
+
+/* Parse the CLI/env supplied port while guarding against invalid values. */
+static int parse_port(const char *value, int fallback, const char *source) {
+    if (!value || *value == '\0') {
+        return fallback;
+    }
+
+    char *endptr = NULL;
+    errno = 0;
+    long candidate = strtol(value, &endptr, 10);
+    if (errno != 0 || endptr == value || *endptr != '\0' ||
+        candidate <= 0 || candidate > 65535) {
+        if (source) {
+            fprintf(stderr,
+                    "[WARN] Ignoring invalid %s \"%s\". Using port %d.\n",
+                    source, value, fallback);
+        }
+        return fallback;
+    }
+    return (int)candidate;
+}
 
 static void restore_fd(int original_fd, int target_fd) {
     if (original_fd != -1) {
@@ -22,7 +62,9 @@ static void restore_fd(int original_fd, int target_fd) {
     }
 }
 
+/* Execute a parsed pipeline while capturing both stdout and stderr into memory. */
 static int run_shell_command(const char *command, char **output, int *status) {
+    /* Capture child output via a pipe shared between stdout/stderr. */
     int pipefd[2];
     if (pipe(pipefd) == -1) {
         return -1;
@@ -61,6 +103,7 @@ static int run_shell_command(const char *command, char **output, int *status) {
         return -1;
     }
     
+    /* Reuse the Phase-1 parser/executor to keep behavior consistent. */
     if (parse_command_line(line_copy, &pipeline) == 0) {
         if (validate_pipeline(&pipeline) == 0) {
             local_status = (execute_pipeline(&pipeline) == 0) ? 0 : 1;
@@ -89,6 +132,7 @@ static int run_shell_command(const char *command, char **output, int *status) {
     }
     
     ssize_t bytes;
+    /* Slurp everything the child wrote into a dynamically sized buffer. */
     while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
         if (total + (size_t)bytes + 1 > capacity) {
             capacity = (capacity + bytes) * 2;
@@ -119,6 +163,7 @@ static int run_shell_command(const char *command, char **output, int *status) {
     return 0;
 }
 
+/* Helper that mirrors the rubric logging style for multi-line responses. */
 static void log_multiline_output(const char *prefix, const char *output) {
     if (!output || output[0] == '\0') {
         printf("%s (no output)\n", prefix);
@@ -208,96 +253,134 @@ static int is_actual_command_name(const char *command_line, const char *candidat
     return result;
 }
 
-static void handle_client(int client_fd) {
+/* Per-client service loop: read a line, execute it, log everything, send response. */
+static void handle_client(client_context_t *ctx) {
     while (1) {
         char *command = NULL;
         size_t command_length = 0;
         
-        if (recv_message(client_fd, &command, &command_length) == -1) {
-            printf("[INFO] Client disconnected unexpectedly.\n");
+        if (recv_message(ctx->client_fd, &command, &command_length) == -1) {
+            printf("[INFO] [Client #%d - %s:%d] Disconnected unexpectedly.\n",
+                   ctx->client_id, ctx->client_ip, ctx->client_port);
             free(command);
             break;
         }
         
         char *trimmed = trim_whitespace(command);
         if (trimmed[0] == '\0') {
+            /* Client hit enter on an empty line—send a blank reply so the prompt returns. */
             free(command);
-            if (send_message(client_fd, "", 0) == -1) {
-                printf("[ERROR] Failed to acknowledge empty command.\n");
+            printf("[OUTPUT] [Client #%d - %s:%d] Empty command received; sending acknowledgment.\n",
+                   ctx->client_id, ctx->client_ip, ctx->client_port);
+            if (send_message(ctx->client_fd, "", 0) == -1) {
+                printf("[ERROR] [Client #%d - %s:%d] Failed to acknowledge empty command.\n",
+                       ctx->client_id, ctx->client_ip, ctx->client_port);
                 break;
             }
             continue;
         }
         
-        printf("[RECEIVED] Received command: \"%s\" from client.\n", trimmed);
+        printf("\n");
+        printf("[RECEIVED] [Client #%d - %s:%d] Received command: \"%s\"\n",
+               ctx->client_id, ctx->client_ip, ctx->client_port, trimmed);
         
         if (strcmp(trimmed, "exit") == 0) {
+            /* Client asked to close the session; fall out of the loop gracefully. */
             free(command);
-            printf("[INFO] Client requested exit.\n");
+            printf("[INFO] [Client #%d - %s:%d] Client requested disconnect. Closing connection.\n",
+                   ctx->client_id, ctx->client_ip, ctx->client_port);
             break;
         }
         
-        printf("[EXECUTING] Executing command: \"%s\"\n", trimmed);
+        printf("[EXECUTING] [Client #%d - %s:%d] Executing command: \"%s\"\n",
+               ctx->client_id, ctx->client_ip, ctx->client_port, trimmed);
         
         char *output = NULL;
         int status = 0;
         if (run_shell_command(trimmed, &output, &status) == -1) {
+            /* Phase-1 executor reported an internal failure; apologize to this client only. */
             const char *error_message = "Internal server error.\n";
-            printf("[ERROR] Failed to execute command.\n");
-            send_message(client_fd, error_message, strlen(error_message));
+            printf("[ERROR] [Client #%d - %s:%d] Failed to execute command.\n",
+                   ctx->client_id, ctx->client_ip, ctx->client_port);
+            char prefix[256];
+            snprintf(prefix, sizeof(prefix),
+                     "[OUTPUT] [Client #%d - %s:%d] Sending error message to client:",
+                     ctx->client_id, ctx->client_ip, ctx->client_port);
+            log_multiline_output(prefix, error_message);
+            if (send_message(ctx->client_fd, error_message, strlen(error_message)) == -1) {
+                printf("[ERROR] [Client #%d - %s:%d] Failed to send internal error message.\n",
+                       ctx->client_id, ctx->client_ip, ctx->client_port);
+                free(command);
+                free(output);
+                break;
+            }
             free(command);
             free(output);
             continue;
         }
         
-        char *send_buffer = output;
-        int send_buffer_allocated = 0;
-        
+        char prefix[256];
         if (status == 0) {
-            log_multiline_output("[OUTPUT] Sending output to client:", output);
+            snprintf(prefix, sizeof(prefix),
+                     "[OUTPUT] [Client #%d - %s:%d] Sending output to client:",
+                     ctx->client_id, ctx->client_ip, ctx->client_port);
+            log_multiline_output(prefix, output);
         } else {
             char *missing_cmd = NULL;
             if (extract_missing_command(output, &missing_cmd) &&
                 is_actual_command_name(trimmed, missing_cmd)) {
                 /* Log rubric-formatted line, but send the actual captured output
                    so client sees both the error and any pipeline output (e.g., '0'). */
-                printf("[ERROR] Command not found: \"%s\"\n", missing_cmd);
-                log_multiline_output("[OUTPUT] Sending error message to client:", output);
-                /* send_buffer remains 'output' */
+                printf("[ERROR] [Client #%d - %s:%d] Command not found: \"%s\"\n",
+                       ctx->client_id, ctx->client_ip, ctx->client_port, missing_cmd);
+                snprintf(prefix, sizeof(prefix),
+                         "[OUTPUT] [Client #%d - %s:%d] Sending error message to client:",
+                         ctx->client_id, ctx->client_ip, ctx->client_port);
+                log_multiline_output(prefix, output);
                 free(missing_cmd);
             } else {
-                printf("[ERROR] Command completed with errors.\n");
-                log_multiline_output("[OUTPUT] Sending error message to client:", output);
+                printf("[ERROR] [Client #%d - %s:%d] Command completed with errors.\n",
+                       ctx->client_id, ctx->client_ip, ctx->client_port);
+                snprintf(prefix, sizeof(prefix),
+                         "[OUTPUT] [Client #%d - %s:%d] Sending error message to client:",
+                         ctx->client_id, ctx->client_ip, ctx->client_port);
+                log_multiline_output(prefix, output);
             }
         }
         
-        size_t send_length = strlen(send_buffer);
-        if (send_message(client_fd, send_buffer, send_length) == -1) {
-            printf("[ERROR] Failed to send response to client.\n");
+        size_t send_length = strlen(output);
+        if (send_message(ctx->client_fd, output, send_length) == -1) {
+            /* If the socket errored here, assume the client vanished. */
+            printf("[ERROR] [Client #%d - %s:%d] Failed to send response to client.\n",
+                   ctx->client_id, ctx->client_ip, ctx->client_port);
             free(command);
-            if (send_buffer_allocated) {
-                free(send_buffer);
-            }
             free(output);
             break;
         }
         
         free(command);
-        if (send_buffer_allocated) {
-            free(send_buffer);
-        }
         free(output);
     }
 }
 
+/* Thread trampoline that owns a client until disconnect, then frees resources. */
+static void *client_thread(void *arg) {
+    client_context_t *ctx = arg;
+    handle_client(ctx);
+    printf("[INFO] Client #%d disconnected from %s:%d.\n",
+           ctx->client_id, ctx->client_ip, ctx->client_port);
+    close(ctx->client_fd);
+    free(ctx);
+    return NULL;
+}
+
+/* Listener loop: accept sockets, label them, and hand them to detached threads. */
 int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
+
+    port = parse_port(getenv(SERVER_PORT_ENV), port, SERVER_PORT_ENV);
     if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0) {
-            fprintf(stderr, "Invalid port provided. Using default %d.\n", DEFAULT_PORT);
-            port = DEFAULT_PORT;
-        }
+        port = parse_port(argv[1], port, "command-line port");
     }
     
     signal(SIGPIPE, SIG_IGN);
@@ -340,14 +423,41 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        printf("[INFO] Client connected from %s:%d.\n", client_ip, ntohs(client_addr.sin_port));
+        client_context_t *ctx = malloc(sizeof(*ctx));
+        if (!ctx) {
+            perror("malloc");
+            close(client_fd);
+            continue;
+        }
+        ctx->client_fd = client_fd;
+        ctx->client_port = ntohs(client_addr.sin_port);
+        if (!inet_ntop(AF_INET, &client_addr.sin_addr, ctx->client_ip, sizeof(ctx->client_ip))) {
+            strncpy(ctx->client_ip, "unknown", sizeof(ctx->client_ip) - 1);
+            ctx->client_ip[sizeof(ctx->client_ip) - 1] = '\0';
+        }
         
-        handle_client(client_fd);
+        pthread_mutex_lock(&client_id_lock);
+        ctx->client_id = next_client_id++;
+        pthread_mutex_unlock(&client_id_lock);
         
-        close(client_fd);
-        printf("[INFO] Client connection closed.\n");
+        pthread_mutex_lock(&thread_label_lock);
+        ctx->thread_label = next_thread_label++;
+        pthread_mutex_unlock(&thread_label_lock);
+        
+        printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
+               ctx->client_id, ctx->client_ip, ctx->client_port, ctx->thread_label);
+        
+        pthread_t thread_handle;
+        if (pthread_create(&thread_handle, NULL, client_thread, ctx) != 0) {
+            perror("pthread_create");
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        
+        if (pthread_detach(thread_handle) != 0) {
+            perror("pthread_detach");
+        }
     }
     
     close(server_fd);
