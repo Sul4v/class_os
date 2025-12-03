@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -242,6 +243,9 @@ static int send_locked_message(client_context_t *ctx, const char *data, size_t l
     pthread_mutex_lock(&ctx->send_lock);
     int rc = send_message(ctx->client_fd, data, length);
     pthread_mutex_unlock(&ctx->send_lock);
+    if (rc == -1) {
+        ctx->disconnected = 1;
+    }
     return rc;
 }
 
@@ -1084,6 +1088,13 @@ int main(int argc, char *argv[]) {
             close(client_fd);
             continue;
         }
+        
+        /* Set send timeout to prevent indefinite blocking on abrupt disconnect */
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        
         ctx->client_fd = client_fd;
         ctx->client_port = ntohs(client_addr.sin_port);
         if (!inet_ntop(AF_INET, &client_addr.sin_addr, ctx->client_ip, sizeof(ctx->client_ip))) {
