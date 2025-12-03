@@ -707,15 +707,6 @@ static void requeue_program_task(task_t *task) {
     pthread_mutex_unlock(&scheduler_lock);
 }
 
-static void log_waiting_tasks(void) {
-    pthread_mutex_lock(&scheduler_lock);
-    task_t *iter = ready_head;
-    while (iter) {
-        printf("(%d)--- " COLOR_YELLOW "waiting" COLOR_RESET " (%.0f)\n", iter->client->client_id, iter->remaining_time);
-        iter = iter->next;
-    }
-    pthread_mutex_unlock(&scheduler_lock);
-}
 
 static int finalize_if_completed(task_t *task) {
     if (!task) return 1;
@@ -760,7 +751,6 @@ static void run_program_task_slice(task_t *task) {
     if (!task->is_running) {
         killpg(task->pgid > 0 ? task->pgid : task->pid, SIGCONT);
         task->is_running = 1;
-        log_waiting_tasks();
         printf("(%d)--- " COLOR_CYAN "running" COLOR_RESET " (%.0f)\n", task->client->client_id, task->remaining_time);
     }
 
