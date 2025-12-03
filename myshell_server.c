@@ -602,9 +602,18 @@ static task_t *select_next_task_locked(void) {
 }
 
 static void request_preemption_if_needed(task_t *task) {
-    if (!task || task->type != TASK_TYPE_PROGRAM) {
+    if (!task) {
         return;
     }
+    /* Shell tasks always preempt running program tasks */
+    if (task->type == TASK_TYPE_SHELL) {
+        if (current_task && current_task->type == TASK_TYPE_PROGRAM &&
+            current_task->is_running && !current_task->preempt_requested) {
+            current_task->preempt_requested = 1;
+        }
+        return;
+    }
+    /* Program tasks preempt if they have shorter remaining time */
     if (current_task && current_task->type == TASK_TYPE_PROGRAM && current_task != task &&
         current_task->is_running && !current_task->preempt_requested &&
         current_task->remaining_time > task->remaining_time) {
@@ -647,7 +656,7 @@ static void deliver_task_output(task_t *task, int status_code) {
         }
     }
 
-    if (!task->streaming) {
+    if (!task->streaming && payload_len > 0) {
         if (send_locked_message(task->client, payload, payload_len) == -1) {
             printf("[ERROR] [Client #%d - %s:%d] Failed to send response to client.\n",
                    task->client->client_id, task->client->client_ip, task->client->client_port);
