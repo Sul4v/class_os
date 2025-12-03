@@ -23,6 +23,16 @@
 #define BACKLOG 10           /* Pending connection queue depth */
 #define SERVER_PORT_ENV "MYSHELL_PORT"
 
+/* ANSI color codes */
+#define COLOR_RESET   "\033[0m"
+#define COLOR_RED     "\033[91m"
+#define COLOR_GREEN   "\033[92m"
+#define COLOR_YELLOW  "\033[93m"
+#define COLOR_BLUE    "\033[94m"
+#define COLOR_CYAN    "\033[96m"
+#define COLOR_WHITE   "\033[97m"
+#define COLOR_BG_CYAN "\033[46m"
+
 /* All metadata the worker thread needs for logging and cleanup. */
 typedef struct {
     int client_fd;
@@ -79,6 +89,41 @@ static int next_arrival_order = 1;
 static int last_scheduled_task = -1;
 static int scheduler_shutdown = 0;
 static pthread_t scheduler_thread;
+
+/* Gantt chart tracking */
+#define MAX_GANTT_ENTRIES 256
+static struct {
+    int task_id;
+    int time;
+} gantt_history[MAX_GANTT_ENTRIES];
+static int gantt_count = 0;
+static int gantt_time = 0;
+static pthread_mutex_t gantt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void gantt_record_stop(int task_id, int elapsed) {
+    pthread_mutex_lock(&gantt_lock);
+    gantt_time += elapsed;
+    if (gantt_count < MAX_GANTT_ENTRIES) {
+        gantt_history[gantt_count].task_id = task_id;
+        gantt_history[gantt_count].time = gantt_time;
+        gantt_count++;
+    }
+    pthread_mutex_unlock(&gantt_lock);
+}
+
+static void gantt_print_and_reset(void) {
+    pthread_mutex_lock(&gantt_lock);
+    if (gantt_count > 0) {
+        printf(COLOR_BG_CYAN "P%d-(%d)", gantt_history[0].task_id, gantt_history[0].time);
+        for (int i = 1; i < gantt_count; i++) {
+            printf("-P%d-(%d)", gantt_history[i].task_id, gantt_history[i].time);
+        }
+        printf(COLOR_RESET "\n");
+        gantt_count = 0;
+        gantt_time = 0;
+    }
+    pthread_mutex_unlock(&gantt_lock);
+}
 
 /* Global counters guarded by mutexes so log labels never clash. */
 static pthread_mutex_t client_id_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -149,6 +194,12 @@ static pid_t spawn_backend_process(const char *command, int start_suspended, int
 
     if (pid == 0) {
         setpgid(0, 0);
+        /* Redirect stdin from /dev/null to prevent blocking on input */
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
         if (dup2(pipefd[1], STDOUT_FILENO) == -1 ||
             dup2(pipefd[1], STDERR_FILENO) == -1) {
             _exit(1);
@@ -327,95 +378,6 @@ static void free_task(task_t *task) {
     free(task);
 }
 
-/* Helper that mirrors the rubric logging style for multi-line responses. */
-static void log_multiline_output(const char *prefix, const char *output) {
-    if (!output || output[0] == '\0') {
-        printf("%s (no output)\n", prefix);
-        return;
-    }
-    
-    printf("%s\n", prefix);
-    fputs(output, stdout);
-    if (output[strlen(output) - 1] != '\n') {
-        putchar('\n');
-    }
-}
-
-static int extract_missing_command(const char *output, char **missing) {
-    /* Be robust to both messages:
-       - "myshell: <cmd>: command not found"
-       - "myshell: <cmd>: No such file or directory"
-       Scan line-by-line for a prefix and accepted suffixes. */
-    const char *prefix = "myshell: ";
-    const char *suffix1 = "command not found";
-    const char *suffix2 = "No such file or directory";
-    size_t prefix_len = strlen(prefix);
-
-    if (!output) {
-        return 0;
-    }
-
-    const char *p = output;
-    while (*p != '\0') {
-        /* Move to start of next non-empty line */
-        while (*p == '\n') p++;
-        if (*p == '\0') break;
-
-        if (strncmp(p, prefix, prefix_len) == 0) {
-            const char *cmd_start = p + prefix_len;
-            const char *colon = strchr(cmd_start, ':');
-            if (colon) {
-                const char *msg = colon + 1;
-                while (*msg == ' ') msg++;
-                if ((strstr(msg, suffix1) != NULL) || (strstr(msg, suffix2) != NULL)) {
-                    size_t cmd_len = (size_t)(colon - cmd_start);
-                    char *command = malloc(cmd_len + 1);
-                    if (!command) {
-                        return 0;
-                    }
-                    memcpy(command, cmd_start, cmd_len);
-                    command[cmd_len] = '\0';
-                    *missing = command;
-                    return 1;
-                }
-            }
-        }
-
-        /* Advance to next line */
-        const char *nl = strchr(p, '\n');
-        if (!nl) break;
-        p = nl + 1;
-    }
-
-    return 0;
-}
-
-/* Verify that a candidate token is actually one of the command names
-   (argv[0]) present in the parsed pipeline of the provided command line. */
-static int is_actual_command_name(const char *command_line, const char *candidate) {
-    if (!command_line || !candidate || *candidate == '\0') {
-        return 0;
-    }
-    pipeline_t pipeline;
-    memset(&pipeline, 0, sizeof(pipeline));
-    char *copy = strdup(command_line);
-    if (!copy) {
-        return 0;
-    }
-    int result = 0;
-    if (parse_command_line(copy, &pipeline) == 0 && pipeline.num_commands > 0) {
-        for (int i = 0; i < pipeline.num_commands; i++) {
-            command_t *cmd = &pipeline.commands[i];
-            if (cmd->argc > 0 && cmd->args[0] && strcmp(cmd->args[0], candidate) == 0) {
-                result = 1;
-                break;
-            }
-        }
-    }
-    free(copy);
-    free_pipeline(&pipeline);
-    return result;
-}
 
 static int parse_program_command(const char *line, char **actual_command, double *burst_hint) {
     const char *ptr = line;
@@ -622,6 +584,7 @@ static void request_preemption_if_needed(task_t *task) {
 }
 
 static void deliver_task_output(task_t *task, int status_code) {
+    (void)status_code;
     if (!task || !task->client || task->client->disconnected) {
         return;
     }
@@ -629,40 +592,16 @@ static void deliver_task_output(task_t *task, int status_code) {
     const char *payload = task->output_buffer ? task->output_buffer : "";
     size_t payload_len = task->output_buffer ? task->output_len : 0;
 
-    char prefix[256];
-    if (status_code == 0) {
-        snprintf(prefix, sizeof(prefix),
-                 "[OUTPUT] [Client #%d - %s:%d] Sending output to client:",
-                 task->client->client_id, task->client->client_ip, task->client->client_port);
-        log_multiline_output(prefix, payload);
-    } else {
-        char *missing_cmd = NULL;
-        if (extract_missing_command(payload, &missing_cmd) &&
-            is_actual_command_name(task->command, missing_cmd)) {
-            printf("[ERROR] [Client #%d - %s:%d] Command not found: \"%s\"\n",
-                   task->client->client_id, task->client->client_ip, task->client->client_port, missing_cmd);
-            snprintf(prefix, sizeof(prefix),
-                     "[OUTPUT] [Client #%d - %s:%d] Sending error message to client:",
-                     task->client->client_id, task->client->client_ip, task->client->client_port);
-            log_multiline_output(prefix, payload);
-            free(missing_cmd);
-        } else {
-            printf("[ERROR] [Client #%d - %s:%d] Command completed with errors.\n",
-                   task->client->client_id, task->client->client_ip, task->client->client_port);
-            snprintf(prefix, sizeof(prefix),
-                     "[OUTPUT] [Client #%d - %s:%d] Sending error message to client:",
-                     task->client->client_id, task->client->client_ip, task->client->client_port);
-            log_multiline_output(prefix, payload);
-        }
-    }
-
     if (!task->streaming && payload_len > 0) {
         if (send_locked_message(task->client, payload, payload_len) == -1) {
-            printf("[ERROR] [Client #%d - %s:%d] Failed to send response to client.\n",
-                   task->client->client_id, task->client->client_ip, task->client->client_port);
+            return;
         }
     }
+    if (payload_len > 0) {
+        printf(COLOR_CYAN "[%d]<<< %zu bytes sent" COLOR_RESET "\n", task->client->client_id, payload_len);
+    }
     send_completion_signal(task);
+    printf("(%d)--- " COLOR_RED "ended" COLOR_RESET " (%.0f)\n", task->client->client_id, task->remaining_time);
 }
 
 static int start_program_task(task_t *task) {
@@ -689,9 +628,7 @@ static int start_program_task(task_t *task) {
     task->has_started = 1;
     task->is_running = 0;
     task->preempt_requested = 0;
-    printf("[SCHED] [Client #%d - %s:%d] Starting program task #%d (burst %.1fs).\n",
-           task->client->client_id, task->client->client_ip, task->client->client_port,
-           task->id, task->burst_time);
+    printf("(%d)--- " COLOR_GREEN "started" COLOR_RESET " (%.0f)\n", task->client->client_id, task->burst_time);
     return 0;
 }
 
@@ -743,8 +680,7 @@ static void finalize_program_task(task_t *task, int status) {
 
 static void process_shell_task(task_t *task) {
     if (!task) return;
-    printf("[SCHED] [Client #%d - %s:%d] Running shell task #%d immediately.\n",
-           task->client->client_id, task->client->client_ip, task->client->client_port, task->id);
+    printf("(%d)--- " COLOR_GREEN "started" COLOR_RESET " (-1)\n", task->client->client_id);
     char *output = NULL;
     int status = 1;
     if (run_shell_command(task->command, &output, &status) == -1) {
@@ -771,16 +707,14 @@ static void requeue_program_task(task_t *task) {
     pthread_mutex_unlock(&scheduler_lock);
 }
 
-static void log_queue_state(void) {
-    int count = 0;
+static void log_waiting_tasks(void) {
     pthread_mutex_lock(&scheduler_lock);
     task_t *iter = ready_head;
     while (iter) {
-        count++;
+        printf("(%d)--- " COLOR_YELLOW "waiting" COLOR_RESET " (%.0f)\n", iter->client->client_id, iter->remaining_time);
         iter = iter->next;
     }
     pthread_mutex_unlock(&scheduler_lock);
-    printf("[SCHED] Ready queue size: %d\n", count);
 }
 
 static int finalize_if_completed(task_t *task) {
@@ -822,16 +756,20 @@ static void run_program_task_slice(task_t *task) {
         quantum = 1;
     }
 
+    int elapsed_this_run = 0;
     if (!task->is_running) {
         killpg(task->pgid > 0 ? task->pgid : task->pid, SIGCONT);
         task->is_running = 1;
-        printf("[SCHED] [Client #%d - %s:%d] Task #%d running (remaining %.1fs, quantum %ds).\n",
-               task->client->client_id, task->client->client_ip, task->client->client_port,
-               task->id, task->remaining_time, quantum);
+        log_waiting_tasks();
+        printf("(%d)--- " COLOR_CYAN "running" COLOR_RESET " (%.0f)\n", task->client->client_id, task->remaining_time);
     }
+
+    /* Save task_id before any operation that might free the task */
+    int saved_task_id = task->id;
 
     for (int second = 0; second < quantum; second++) {
         if (check_cancellation(task)) {
+            gantt_record_stop(saved_task_id, elapsed_this_run);
             terminate_program_task(task);
             free_task(task);
             return;
@@ -839,6 +777,7 @@ static void run_program_task_slice(task_t *task) {
 
         struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
         nanosleep(&ts, NULL);
+        elapsed_this_run++;
         if (task->remaining_time > 0) {
             task->remaining_time -= 1.0;
             if (task->remaining_time < 0) {
@@ -847,12 +786,20 @@ static void run_program_task_slice(task_t *task) {
         }
         drain_task_pipe(task);
         if (task->cancelled) {
+            gantt_record_stop(saved_task_id, elapsed_this_run);
             terminate_program_task(task);
             free_task(task);
             return;
         }
 
         if (finalize_if_completed(task)) {
+            gantt_record_stop(saved_task_id, elapsed_this_run);
+            pthread_mutex_lock(&scheduler_lock);
+            int queue_empty = (ready_head == NULL);
+            pthread_mutex_unlock(&scheduler_lock);
+            if (queue_empty) {
+                gantt_print_and_reset();
+            }
             return;
         }
 
@@ -861,18 +808,25 @@ static void run_program_task_slice(task_t *task) {
         task->preempt_requested = 0;
         pthread_mutex_unlock(&scheduler_lock);
         if (preempt) {
-            printf("[SCHED] Preempting task #%d for shorter job.\n", task->id);
             break;
         }
     }
 
     if (finalize_if_completed(task)) {
+        gantt_record_stop(saved_task_id, elapsed_this_run);
+        pthread_mutex_lock(&scheduler_lock);
+        int queue_empty = (ready_head == NULL);
+        pthread_mutex_unlock(&scheduler_lock);
+        if (queue_empty) {
+            gantt_print_and_reset();
+        }
         return;
     }
 
     /* Quantum expired or preemption requested; stop task and requeue. */
     if (killpg(task->pgid > 0 ? task->pgid : task->pid, SIGSTOP) == -1) {
         if (errno == ESRCH) {
+            gantt_record_stop(saved_task_id, elapsed_this_run);
             finalize_if_completed(task);
             return;
         }
@@ -882,7 +836,8 @@ static void run_program_task_slice(task_t *task) {
     task->is_running = 0;
     task->first_round_completed = 1;
     drain_task_pipe(task);
-    printf("[SCHED] Task #%d paused with %.1fs remaining.\n", task->id, task->remaining_time);
+    gantt_record_stop(saved_task_id, elapsed_this_run);
+    printf("(%d)--- " COLOR_YELLOW "waiting" COLOR_RESET " (%.0f)\n", task->client->client_id, task->remaining_time);
     if (!task->cancelled) {
         requeue_program_task(task);
     } else {
@@ -966,16 +921,12 @@ static void handle_client(client_context_t *ctx) {
         size_t command_length = 0;
 
         if (recv_message(ctx->client_fd, &command, &command_length) == -1) {
-            printf("[INFO] [Client #%d - %s:%d] Disconnected unexpectedly.\n",
-                   ctx->client_id, ctx->client_ip, ctx->client_port);
             free(command);
             break;
         }
 
         char *trimmed = trim_whitespace(command);
         if (trimmed[0] == '\0') {
-            printf("[OUTPUT] [Client #%d - %s:%d] Empty command received; sending acknowledgment.\n",
-                   ctx->client_id, ctx->client_ip, ctx->client_port);
             if (send_locked_message(ctx, "", 0) == -1) {
                 free(command);
                 break;
@@ -984,13 +935,10 @@ static void handle_client(client_context_t *ctx) {
             continue;
         }
 
-        printf("\n[RECEIVED] [Client #%d - %s:%d] Received command: \"%s\"\n",
-               ctx->client_id, ctx->client_ip, ctx->client_port, trimmed);
+        printf("[%d]>>> %s\n", ctx->client_id, trimmed);
 
         if (strcmp(trimmed, "exit") == 0) {
             free(command);
-            printf("[INFO] [Client #%d - %s:%d] Client requested disconnect. Closing connection.\n",
-                   ctx->client_id, ctx->client_ip, ctx->client_port);
             break;
         }
 
@@ -1002,22 +950,14 @@ static void handle_client(client_context_t *ctx) {
             continue;
         }
 
+        printf("(%d)--- " COLOR_BLUE "created" COLOR_RESET " (%.0f)\n", ctx->client_id, task->burst_time);
+
         pthread_mutex_lock(&scheduler_lock);
         push_ready_task_locked(task);
         request_preemption_if_needed(task);
         pthread_cond_signal(&scheduler_cond);
         pthread_mutex_unlock(&scheduler_lock);
 
-        if (task->type == TASK_TYPE_PROGRAM) {
-            printf("[QUEUE] [Client #%d - %s:%d] Added program task #%d (burst %.1fs).\n",
-                   ctx->client_id, ctx->client_ip, ctx->client_port,
-                   task->id, task->burst_time);
-        } else {
-            printf("[QUEUE] [Client #%d - %s:%d] Added shell task #%d for immediate execution.\n",
-                   ctx->client_id, ctx->client_ip, ctx->client_port, task->id);
-        }
-
-        log_queue_state();
         free(command);
     }
 }
@@ -1028,8 +968,6 @@ static void *client_thread(void *arg) {
     handle_client(ctx);
     ctx->disconnected = 1;
     cancel_client_tasks(ctx);
-    printf("[INFO] Client #%d disconnected from %s:%d.\n",
-           ctx->client_id, ctx->client_ip, ctx->client_port);
     close(ctx->client_fd);
     pthread_mutex_destroy(&ctx->send_lock);
     free(ctx);
@@ -1080,7 +1018,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("[INFO] Server started, waiting for client connections on port %d...\n", port);
+    printf("-----------------------------\n");
+    printf("| Hello, Server Started |\n");
+    printf("-----------------------------\n");
     
     while (1) {
         struct sockaddr_in client_addr;
@@ -1121,8 +1061,7 @@ int main(int argc, char *argv[]) {
         ctx->thread_label = next_thread_label++;
         pthread_mutex_unlock(&thread_label_lock);
         
-        printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
-               ctx->client_id, ctx->client_ip, ctx->client_port, ctx->thread_label);
+        printf(COLOR_CYAN "[%d]<<< client connected" COLOR_RESET "\n", ctx->client_id);
         
         pthread_t thread_handle;
         if (pthread_create(&thread_handle, NULL, client_thread, ctx) != 0) {
