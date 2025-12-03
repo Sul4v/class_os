@@ -113,24 +113,27 @@ int main(int argc, char *argv[]) {
             break;
         }
         
-        char *response = NULL;
-        size_t response_length = 0;
-        if (recv_message(client_fd, &response, &response_length) == -1) {
-            fprintf(stderr, "Connection closed by server.\n");
-            free(response);
-            break;
-        }
-        
-        if (response_length > 0) {
+        while (1) {
+            char *response = NULL;
+            size_t response_length = 0;
+            if (recv_message(client_fd, &response, &response_length) == -1) {
+                fprintf(stderr, "Connection closed by server.\n");
+                free(response);
+                goto cleanup;
+            }
+            if (response_length == 0) {
+                free(response);
+                break;
+            }
             fputs(response, stdout);
             if (response[response_length - 1] != '\n') {
                 putchar('\n');
             }
+            free(response);
         }
-        
-        free(response);
     }
     
+cleanup:
     close(client_fd);
     printf("[INFO] Disconnected from server.\n");
     return EXIT_SUCCESS;

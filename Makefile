@@ -8,6 +8,7 @@ CFLAGS = -Wall -Wextra -std=c99 -pedantic -g
 TARGET = myshell
 SERVER = server
 CLIENT = client
+DEMO = demo
 
 CORE_SOURCES = parser.c executor.c error_handler.c
 CORE_OBJECTS = $(CORE_SOURCES:.c=.o)
@@ -21,7 +22,7 @@ SERVER_LIBS = -lpthread
 
 HEADERS = myshell.h parser.h executor.h error_handler.h network_utils.h
 
-all: $(TARGET) $(SERVER) $(CLIENT)
+all: $(TARGET) $(SERVER) $(CLIENT) $(DEMO)
 
 $(TARGET): myshell.o $(CORE_OBJECTS)
 	$(CC) $(CFLAGS) -o $(TARGET) $^
@@ -32,11 +33,14 @@ $(SERVER): $(SERVER_OBJECTS) $(CORE_OBJECTS)
 $(CLIENT): $(CLIENT_OBJECTS)
 	$(CC) $(CFLAGS) -o $(CLIENT) $(CLIENT_OBJECTS)
 
+$(DEMO): demo.o
+	$(CC) $(CFLAGS) -o $(DEMO) demo.o
+
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o $(TARGET) $(SERVER) $(CLIENT) myshell_server myshell_client
+	rm -f *.o $(TARGET) $(SERVER) $(CLIENT) $(DEMO) myshell_server myshell_client
 
 # Force rebuild
 rebuild: clean all

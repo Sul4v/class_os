@@ -73,6 +73,24 @@ myshell/
   - Checks for empty commands and missing arguments
   - Provides helpful error messages matching the specification
 
+#### 5. Remote Scheduler (`myshell_server.c` - Phase 4)
+- **Purpose**: Coordinates concurrent remote clients by funneling every command through a single scheduler thread that simulates a CPU scheduler.
+- **Key Structures**:
+  - `task_t`: Represents a client request (shell vs program task, burst/remaining time, owning client, captured output, etc.)
+  - Global ready queue protected by `scheduler_lock`/`scheduler_cond` so client threads can enqueue work safely.
+- **Scheduling Features**:
+  - Shell commands (`ls`, `cat`, etc.) become priority tasks (burst `-1`) and are executed immediately via the existing parser/executor.
+  - Program commands (e.g., `program <burst> <cmd>`, `demo N`, or any long-running executable) run in their own worker process and are preempted according to a Round-Robin + Shortest-Job-Remaining hybrid policy (3s first quantum, 7s for later rounds, no back-to-back reuse unless they are alone).
+  - Newly arrived shorter jobs can preempt the currently running program; all state (remaining time, captured output, PID) is preserved so the scheduler can `SIGSTOP`/`SIGCONT` the process rather than restarting it.
+  - Detailed server logs capture queueing, running, preemption, completion, and per-client output delivery to mirror the grading screenshots.
+  - Each client thread only enqueues commands and streams responses with `send_message`; the scheduler thread owns execution so the single-CPU assumption holds.
+
+#### 6. Demo Program (`demo.c`)
+- **Purpose**: Deterministic workload used to demonstrate the scheduler behavior in grading videos.
+- **Usage**: `./demo N` prints one line per second for `N` seconds; when a remote client issues `demo N` or wraps it via `program N ./demo N`, the scheduler receives an accurate burst estimate.
+- **Integration**: `demo N` is parsed as a program task with burst `N`, which makes it easy to observe RR/SJRF preemption in the server logs.
+
+
 ## Supported Features
 
 ### 1. Basic Commands
